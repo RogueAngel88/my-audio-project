@@ -25,30 +25,32 @@ def find_col(df, choices):
             return lookup[choice]
     return None
 
-def read_playlists(upload):
+def read_playlists(uploads):
     playlists = []
-    with zipfile.ZipFile(upload) as zf:
-        for name in zf.namelist():
-            if not name.lower().endswith(".csv") or name.startswith("__MACOSX/"):
-                continue
-            try:
-                raw = zf.read(name)
-                df = pd.read_csv(io.BytesIO(raw))
-            except Exception:
-                continue
-            title_col = find_col(df, ["track name", "song title", "title", "track"])
-            artist_col = find_col(df, ["artist name", "artist", "artists"])
-            if title_col is None or artist_col is None:
-                continue
-            for _, row in df.iterrows():
-                title = str(row.get(title_col, "")).strip()
-                artist = str(row.get(artist_col, "")).strip()
-                if title and artist and title.lower() != "nan" and artist.lower() != "nan":
-                    playlists.append({
-                        "Playlist": Path(name).stem,
-                        "Requested track": title,
-                        "Requested artist": artist
-                    })
+    for upload in uploads:
+        archive_name = Path(upload.name).stem
+        with zipfile.ZipFile(upload) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".csv") or name.startswith("__MACOSX/"):
+                    continue
+                try:
+                    raw = zf.read(name)
+                    df = pd.read_csv(io.BytesIO(raw))
+                except Exception:
+                    continue
+                title_col = find_col(df, ["track name", "song title", "title", "track"])
+                artist_col = find_col(df, ["artist name", "artist", "artists"])
+                if title_col is None or artist_col is None:
+                    continue
+                for _, row in df.iterrows():
+                    title = str(row.get(title_col, "")).strip()
+                    artist = str(row.get(artist_col, "")).strip()
+                    if title and artist and title.lower() != "nan" and artist.lower() != "nan":
+                        playlists.append({
+                            "Playlist": f"{archive_name} / {Path(name).stem}",
+                            "Requested track": title,
+                            "Requested artist": artist
+                        })
     # Remove repeated CSV rows within the same playlist, keeping first occurrence.
     seen, unique = set(), []
     for item in playlists:
@@ -139,17 +141,17 @@ with st.sidebar:
     include_ia = st.checkbox("Show Internet Archive discovery results (not downloadable)", value=False)
     max_tracks = st.selectbox("Tracks to test", [10, 25, 50, 100, "All"], index=0)
 
-upload = st.file_uploader("Upload your Spotify playlist CSV ZIP", type=["zip"])
-if upload:
+uploads = st.file_uploader("Upload your Spotify playlist ZIP files", type=["zip"], accept_multiple_files=True)
+if uploads:
     try:
-        tracks_df = read_playlists(upload)
+        tracks_df = read_playlists(uploads)
     except Exception as exc:
         st.error(f"Could not read ZIP: {exc}")
         tracks_df = pd.DataFrame()
     if tracks_df.empty:
         st.error("No usable CSV tracks found. CSVs need columns such as Track name and Artist name.")
     else:
-        st.success(f"Loaded {len(tracks_df):,} unique tracks from {tracks_df['Playlist'].nunique()} playlists.")
+        st.success(f"Loaded {len(tracks_df):,} unique tracks from {tracks_df['Playlist'].nunique()} playlists across {len(uploads)} ZIP file(s).")
         playlist_names = sorted(tracks_df["Playlist"].unique().tolist())
         selected = st.multiselect("Choose playlist(s)", playlist_names, default=playlist_names[:1])
         subset = tracks_df[tracks_df["Playlist"].isin(selected)].copy()
