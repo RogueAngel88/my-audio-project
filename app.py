@@ -174,6 +174,16 @@ def ccmixter_discovery(title, artist):
             return [], diagnostics
         diagnostics["columns"] = list(rows[0].keys())
         diagnostics["rows_received"] = len(rows)
+        # Show a small, safe metadata sample in the app diagnostics so we can
+        # confirm which API field represents the title and uploader/artist.
+        sample_fields = (
+            "upload_id", "upload_name", "user_name", "user_real_name",
+            "artist_page_url", "license_name", "license_url", "file_page_url"
+        )
+        diagnostics["sample_rows"] = [
+            {field: str(row.get(field, "") or "")[:300] for field in sample_fields}
+            for row in rows[:3]
+        ]
     except Exception as exc:
         diagnostics["error"] = f"{type(exc).__name__}: {exc}"
         return [], diagnostics
@@ -374,6 +384,9 @@ if "search_rows" in st.session_state:
         st.write(f"Exact matches: {cc_diag.get('exact_matches', 0)}")
         if cc_diag.get("columns"):
             st.write("Returned columns:", ", ".join(str(c) for c in cc_diag["columns"]))
+        if cc_diag.get("sample_rows"):
+            st.write("Sample metadata from the last checked track:")
+            st.dataframe(pd.DataFrame(cc_diag["sample_rows"]), use_container_width=True, hide_index=True)
         if cc_diag.get("error"):
             st.error(cc_diag["error"])
 
