@@ -140,12 +140,13 @@ def archive_discovery(title, artist):
 
 
 
+
 def ccmixter_discovery(title, artist):
     """
-    Search ccMixter's documented Query API. Search by exact title phrase first,
-    then compare returned title/artist fields locally. ccMixter API metadata
-    fields vary by dataview, so retain diagnostics rather than silently
-    treating a parse failure as 'no matches'.
+    Search ccMixter by title. Separate exact title+display-name matches from
+    same-title records uploaded by someone else. All ccMixter results remain
+    discovery-only until the individual page, recording identity, and license
+    are manually reviewed.
     """
     params = {
         "f": "csv",
@@ -174,8 +175,6 @@ def ccmixter_discovery(title, artist):
             return [], diagnostics
         diagnostics["columns"] = list(rows[0].keys())
         diagnostics["rows_received"] = len(rows)
-        # Show a small, safe metadata sample in the app diagnostics so we can
-        # confirm which API field represents the title and uploader/artist.
         sample_fields = (
             "upload_id", "upload_name", "user_name", "user_real_name",
             "artist_page_url", "license_name", "license_url", "file_page_url"
@@ -191,62 +190,50 @@ def ccmixter_discovery(title, artist):
     found, seen = [], set()
     for row in rows:
         lower = {str(k).strip().lower(): v for k, v in row.items() if k}
-        name = next((lower[k] for k in (
-            "upload_name", "name", "title", "upload_title"
-        ) if lower.get(k)), "")
-        creator = next((lower[k] for k in (
-            "user_real_name", "artist", "artist_name", "fullname",
-            "user_full_name", "upload_artist", "user_name", "user"
-        ) if lower.get(k)), "")
-        upload_id = next((lower[k] for k in (
-            "upload_id", "id"
-        ) if lower.get(k)), "")
-        license_code = next((lower[k] for k in (
-            "upload_license", "license", "lic"
-        ) if lower.get(k)), "")
+        name = str(lower.get("upload_name") or "").strip()
+        username = str(lower.get("user_name") or "").strip()
+        display_name = str(lower.get("user_real_name") or username).strip()
+        upload_id = str(lower.get("upload_id") or "").strip()
+        license_name = str(lower.get("license_name") or "Not provided").strip()
+        license_url = str(lower.get("license_url") or "").strip()
+        item_url = str(lower.get("file_page_url") or "").strip()
 
-        if norm(name) != norm(title) or norm(creator) != norm(artist):
+        # Only consider same-title records. Do not call a different uploader
+        # the requested artist; classify it as an unverified alternative.
+        if not name or norm(name) != norm(title):
             continue
 
-        identity = str(upload_id or f"{norm(name)}|{norm(creator)}")
+        match_type = (
+            "Exact title + artist/display-name match"
+            if norm(display_name) == norm(artist) or norm(username) == norm(artist)
+            else "Unverified alternative: same title, different uploader"
+        )
+        identity = (upload_id or norm(name), norm(username), match_type)
         if identity in seen:
             continue
         seen.add(identity)
 
-        license_names = {
-            "by": "CC BY (Attribution)",
-            "nc": "CC BY-NC (NonCommercial)",
-            "sa": "CC BY-SA (ShareAlike)",
-            "nod": "CC BY-ND (NoDerivatives)",
-            "byncsa": "CC BY-NC-SA",
-            "byncnd": "CC BY-NC-ND",
-            "s": "Sampling",
-            "splus": "Sampling+",
-            "ncsplus": "NonCommercial Sampling+",
-            "pd": "Public Domain",
-        }
-        license_label = license_names.get(
-            str(license_code).lower(),
-            f"License code: {license_code or 'not returned'}"
-        )
-        item_url = (
-            f"https://ccmixter.org/files/{quote(str(creator))}/{quote(str(upload_id))}"
-            if upload_id else
-            "https://ccmixter.org/api/query?" + requests.compat.urlencode({
-                "f": "page", "t": "search_uploads", "limit": 30,
-                "search_type": "match", "search": title
-            })
-        )
         found.append({
-            "Source": "ccMixter (discovery)",
+            "Source": "ccMixter (discovery only)",
             "Matched title": name,
-            "Matched artist": creator,
-            "License": license_label,
+            "Uploader username": username,
+            "Uploader/display name": display_name,
+            "Match type": match_type,
+            "License": license_name,
+            "License URL": license_url,
             "Source page": item_url,
             "Download URL": "",
-            "Status": "Discovery only. Review the individual upload page and license."
+            "Download allowed": "No",
+            "Status": "Unverified listing. Review the item page, recording identity, license, attribution, and restrictions."
         })
-    diagnostics["exact_matches"] = len(found)
+
+    diagnostics["same_title_records"] = len(found)
+    diagnostics["exact_title_artist_matches"] = sum(
+        1 for item in found if item["Match type"] == "Exact title + artist/display-name match"
+    )
+    diagnostics["alternative_records"] = sum(
+        1 for item in found if item["Match type"].startswith("Unverified alternative")
+    )
     return found, diagnostics
 
 with st.sidebar:
@@ -367,21 +354,35 @@ if "search_rows" in st.session_state:
     cc_rows = st.session_state.get("ccmixter_rows", [])
     st.subheader("ccMixter discovery (license review required)")
     if cc_rows:
-        st.warning("ccMixter results are discovery-only in this version. Open the source page to review the individual upload, attribution requirements, license restrictions, and download options. No automatic MP3 download links are provided.")
+        st.warning("All ccMixter records are discovery-only. A same-title result from a different uploader is not proof that it is an authorized cover or remix of the requested song. Open the item page and review the recording, license, attribution, and restrictions. No MP3 download links are provided.")
         cc_df = pd.DataFrame(cc_rows).drop_duplicates(
-            subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Matched artist"],
+            subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Uploader username", "Match type"],
             keep="first"
         )
-        st.dataframe(cc_df.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+        exact_cc = cc_df[cc_df["Match type"] == "Exact title + artist/display-name match"]
+        alternative_cc = cc_df[cc_df["Match type"].str.startswith("Unverified alternative")]
+        st.markdown("**Exact title + artist/display-name matches**")
+        if not exact_cc.empty:
+            st.dataframe(exact_cc.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+        else:
+            st.info("No exact title + artist/display-name matches.")
+        st.markdown("**Possible alternatives: same title, different uploader**")
+        if not alternative_cc.empty:
+            st.dataframe(alternative_cc.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+        else:
+            st.info("No same-title alternative uploads were returned.")
         for item in cc_df.to_dict("records"):
-            st.markdown(f"- [{item['Matched title']} - {item['Matched artist']}]({item['Source page']})")
+            if item.get("Source page"):
+                st.markdown(f"- [{item['Matched title']} - {item['Uploader/display name'] or item['Uploader username']}]({item['Source page']}) · {item['Match type']}")
     else:
-        st.info("No exact ccMixter matches were returned for this test.")
+        st.info("No same-title ccMixter records were returned for this test.")
     cc_diag = st.session_state.get("ccmixter_diagnostics", {})
     with st.expander("ccMixter API diagnostics"):
         st.write(f"HTTP status: {cc_diag.get('api_status', 'not available')}")
         st.write(f"CSV rows received for the last checked track: {cc_diag.get('rows_received', 0)}")
-        st.write(f"Exact matches: {cc_diag.get('exact_matches', 0)}")
+        st.write(f"Same-title records: {cc_diag.get('same_title_records', 0)}")
+        st.write(f"Exact title + artist/display-name matches: {cc_diag.get('exact_title_artist_matches', 0)}")
+        st.write(f"Possible alternatives (different uploader): {cc_diag.get('alternative_records', 0)}")
         if cc_diag.get("columns"):
             st.write("Returned columns:", ", ".join(str(c) for c in cc_diag["columns"]))
         if cc_diag.get("sample_rows"):
