@@ -1,5 +1,6 @@
 import io
 import re
+import unicodedata
 import zipfile
 from pathlib import Path
 
@@ -11,16 +12,26 @@ API_URL = "https://api.jamendo.com/v3.0/tracks/"
 
 st.set_page_config(page_title="My Audio Project", page_icon="🎵", layout="wide")
 st.title("🎵 My Audio Project")
-st.write("Find downloadable, openly licensed music that matches your playlist CSV files.")
+st.write("Search Jamendo for tracks that match your playlist CSV files.")
+
 st.info(
-    "This app searches Jamendo's independent-music catalog. It does not convert Spotify "
-    "tracks or bypass Spotify protections. Mainstream commercial songs may not be available."
+    "This app searches Jamendo's independent-music catalog. It does not convert "
+    "Spotify tracks or bypass Spotify protections. Most mainstream commercial "
+    "recordings may not be available."
 )
 
 def clean_text(value):
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+def normalize(value):
+    """Normalize case, accents and punctuation, but do not remove meaningful words."""
+    value = unicodedata.normalize("NFKD", clean_text(value))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.casefold()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
 
 def find_column(columns, choices):
     lookup = {str(c).strip().lower(): c for c in columns}
@@ -30,15 +41,16 @@ def find_column(columns, choices):
     return None
 
 def read_playlist_csv(file_bytes, filename):
-    df = pd.read_csv(io.BytesIO(file_bytes))
-    track_col = find_column(df.columns, [
-        "track name", "song title", "track", "title", "name"
-    ])
-    artist_col = find_column(df.columns, [
-        "artist name", "artist", "artists"
-    ])
+    try:
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    except Exception as exc:
+        return None, f"{filename}: couldn't read CSV ({exc})."
+
+    track_col = find_column(df.columns, ["track name", "song title", "track", "title", "name"])
+    artist_col = find_column(df.columns, ["artist name", "artist", "artists"])
     if not track_col or not artist_col:
         return None, f"{filename}: couldn't identify both song-title and artist columns."
+
     out = pd.DataFrame({
         "Playlist": Path(filename).stem,
         "Track": df[track_col].map(clean_text),
@@ -64,27 +76,30 @@ def get_uploaded_csvs(uploaded):
     return files
 
 def jamendo_search(client_id, track, artist):
-    query = f"{track} {artist}"
+    # Search by both requested fields, then independently verify exact normalized values.
     params = {
         "client_id": client_id,
         "format": "json",
-        "limit": 5,
-        "search": query,
+        "limit": 50,
+        "search": track,
+        "artist_name": artist,
         "include": "licenses",
         "audiodlformat": "mp32",
     }
-    response = requests.get(API_URL, params=params, timeout=25)
+    response = requests.get(API_URL, params=params, timeout=30)
     response.raise_for_status()
     payload = response.json()
-    if payload.get("headers", {}).get("status") != "success":
-        raise RuntimeError(payload.get("headers", {}).get("error_message", "Jamendo API error"))
+    headers = payload.get("headers", {})
+    if headers.get("status") != "success":
+        raise RuntimeError(headers.get("error_message", "Jamendo API error"))
     return payload.get("results", [])
 
 client_id = st.text_input(
     "Jamendo API client ID",
     type="password",
-    help="Create a free developer account at developer.jamendo.com and register an app to get your own client ID."
+    help="Enter your Jamendo developer Client ID. Do not put credentials in public source code."
 )
+
 uploads = st.file_uploader(
     "Upload your separated playlist CSV files or the ZIP containing them",
     type=["csv", "zip"],
@@ -100,51 +115,104 @@ if uploads:
             errors.append(error)
         elif frame is not None and not frame.empty:
             frames.append(frame)
+
     for error in errors:
         st.warning(error)
 
     if frames:
         library = pd.concat(frames, ignore_index=True).drop_duplicates()
-        st.success(f"Loaded {len(library)} tracks from {library['Playlist'].nunique()} playlist file(s).")
-        st.dataframe(library.head(30), use_container_width=True, hide_index=True)
+        st.success(
+            f"Loaded {len(library)} tracks from "
+            f"{library['Playlist'].nunique()} playlist file(s)."
+        )
+        st.dataframe(library.head(25), use_container_width=True, hide_index=True)
 
         playlist_names = ["All playlists"] + sorted(library["Playlist"].unique().tolist())
         chosen = st.selectbox("Choose a playlist", playlist_names)
         view = library if chosen == "All playlists" else library[library["Playlist"] == chosen]
+
         max_tracks = min(100, len(view))
-        count = st.number_input("Maximum tracks to search in this run", min_value=1, max_value=max(1, max_tracks), value=min(20, max_tracks))
-        if st.button("Search Jamendo for downloadable matches", type="primary", disabled=not client_id):
+        count = st.number_input(
+            "Maximum tracks to search in this run",
+            min_value=1,
+            max_value=max(1, max_tracks),
+            value=min(10, max_tracks),
+            step=1
+        )
+
+        st.caption(
+            "Strict matching is enabled: a result is accepted only when both the "
+            "normalized song title and artist match. Similar titles, covers, remixes "
+            "and unrelated artists are rejected."
+        )
+
+        if st.button(
+            "Search Jamendo for exact downloadable matches",
+            type="primary",
+            disabled=not client_id
+        ):
             rows = []
             progress = st.progress(0)
             status = st.empty()
             selected = view.head(int(count)).reset_index(drop=True)
+
             for i, row in selected.iterrows():
-                status.write(f"Searching {i+1}/{len(selected)}: {row['Track']} - {row['Artist']}")
+                status.write(
+                    f"Checking {i+1}/{len(selected)}: "
+                    f"{row['Track']} - {row['Artist']}"
+                )
                 try:
-                    results = jamendo_search(client_id, row["Track"], row["Artist"])
-                    allowed = [x for x in results if x.get("audiodownload_allowed") and x.get("audiodownload")]
-                    if allowed:
-                        for candidate in allowed:
+                    candidates = jamendo_search(client_id, row["Track"], row["Artist"])
+                    exact = []
+                    for candidate in candidates:
+                        title_ok = normalize(candidate.get("name", "")) == normalize(row["Track"])
+                        artist_ok = normalize(candidate.get("artist_name", "")) == normalize(row["Artist"])
+                        if title_ok and artist_ok:
+                            exact.append(candidate)
+
+                    downloadable = [
+                        c for c in exact
+                        if c.get("audiodownload_allowed") is True and c.get("audiodownload")
+                    ]
+
+                    if downloadable:
+                        for candidate in downloadable:
                             rows.append({
                                 "Playlist": row["Playlist"],
                                 "Requested track": row["Track"],
                                 "Requested artist": row["Artist"],
-                                "Jamendo track": candidate.get("name", ""),
-                                "Jamendo artist": candidate.get("artist_name", ""),
+                                "Matched track": candidate.get("name", ""),
+                                "Matched artist": candidate.get("artist_name", ""),
+                                "Match status": "Exact title + artist",
+                                "Download allowed": "Yes",
                                 "License": candidate.get("license_ccurl", ""),
-                                "Download allowed": True,
                                 "Download URL": candidate.get("audiodownload", ""),
-                                "Jamendo page": f"https://www.jamendo.com/track/{candidate.get('id','')}",
+                                "Jamendo page": f"https://www.jamendo.com/track/{candidate.get('id', '')}",
+                            })
+                    elif exact:
+                        for candidate in exact:
+                            rows.append({
+                                "Playlist": row["Playlist"],
+                                "Requested track": row["Track"],
+                                "Requested artist": row["Artist"],
+                                "Matched track": candidate.get("name", ""),
+                                "Matched artist": candidate.get("artist_name", ""),
+                                "Match status": "Exact title + artist, but download not permitted",
+                                "Download allowed": "No",
+                                "License": candidate.get("license_ccurl", ""),
+                                "Download URL": "",
+                                "Jamendo page": f"https://www.jamendo.com/track/{candidate.get('id', '')}",
                             })
                     else:
                         rows.append({
                             "Playlist": row["Playlist"],
                             "Requested track": row["Track"],
                             "Requested artist": row["Artist"],
-                            "Jamendo track": "",
-                            "Jamendo artist": "",
+                            "Matched track": "",
+                            "Matched artist": "",
+                            "Match status": "No exact match found",
+                            "Download allowed": "No",
                             "License": "",
-                            "Download allowed": False,
                             "Download URL": "",
                             "Jamendo page": "",
                         })
@@ -153,41 +221,74 @@ if uploads:
                         "Playlist": row["Playlist"],
                         "Requested track": row["Track"],
                         "Requested artist": row["Artist"],
-                        "Jamendo track": "Search error",
-                        "Jamendo artist": str(exc),
+                        "Matched track": "",
+                        "Matched artist": "",
+                        "Match status": f"Search error: {exc}",
+                        "Download allowed": "No",
                         "License": "",
-                        "Download allowed": False,
                         "Download URL": "",
                         "Jamendo page": "",
                     })
                 progress.progress((i + 1) / len(selected))
-            status.success("Search finished. Check every match before downloading; similar titles may be different recordings.")
-            results_df = pd.DataFrame(rows)
-            st.session_state["results_df"] = results_df
+
+            status.success(
+                "Search finished. Only exact title-and-artist matches are listed as matches. "
+                "Check the license and track page before downloading."
+            )
+            st.session_state["results_df"] = pd.DataFrame(rows)
 
 if "results_df" in st.session_state:
     results_df = st.session_state["results_df"]
     st.subheader("Search results")
-    display = results_df.drop(columns=["Download URL"])
-    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    exact_count = int((results_df["Match status"] == "Exact title + artist").sum())
+    no_match_count = int((results_df["Match status"] == "No exact match found").sum())
+    c1, c2 = st.columns(2)
+    c1.metric("Exact downloadable matches", exact_count)
+    c2.metric("Tracks without an exact match", no_match_count)
+
+    st.dataframe(
+        results_df.drop(columns=["Download URL"]),
+        use_container_width=True,
+        hide_index=True
+    )
+
     st.download_button(
         "Download search results as CSV",
         results_df.drop(columns=["Download URL"]).to_csv(index=False).encode("utf-8-sig"),
-        file_name="jamendo_search_results.csv",
+        file_name="jamendo_exact_match_results.csv",
         mime="text/csv"
     )
-    st.caption("Download links are shown below only for tracks Jamendo marks as downloadable.")
-    for idx, item in results_df.iterrows():
-        if item.get("Download allowed") and item.get("Download URL"):
-            label = f"{item['Jamendo track']} - {item['Jamendo artist']} (requested: {item['Requested track']} - {item['Requested artist']})"
-            with st.expander(label):
+
+    st.subheader("Verified downloadable tracks")
+    downloadable_rows = results_df[
+        (results_df["Match status"] == "Exact title + artist") &
+        (results_df["Download allowed"] == "Yes")
+    ]
+
+    if downloadable_rows.empty:
+        st.info(
+            "No exact downloadable matches were found in this search. "
+            "That is better than offering unrelated songs as substitutes."
+        )
+    else:
+        for idx, item in downloadable_rows.iterrows():
+            title = f"{item['Matched track']} - {item['Matched artist']}"
+            with st.expander(title):
                 st.write(f"Playlist: {item['Playlist']}")
-                st.write(f"License: {item['License'] or 'Check the Jamendo track page for license details.'}")
+                st.write(f"License: {item['License'] or 'Open the track page to verify the license.'}")
                 st.markdown(f"[Open Jamendo track page]({item['Jamendo page']})")
+                st.warning(
+                    "Confirm that this is the correct recording and review the license "
+                    "terms before downloading."
+                )
                 try:
-                    audio = requests.get(item["Download URL"], timeout=45)
+                    audio = requests.get(item["Download URL"], timeout=60)
                     audio.raise_for_status()
-                    safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "", f"{item['Jamendo artist']} - {item['Jamendo track']}").strip()
+                    safe_name = re.sub(
+                        r"[^A-Za-z0-9._ -]+", "",
+                        f"{item['Matched artist']} - {item['Matched track']}"
+                    ).strip()
                     st.download_button(
                         "Download MP3",
                         data=audio.content,
