@@ -1,174 +1,219 @@
-import io, re, zipfile, unicodedata
-from pathlib import Path
+import io
+import re
+import zipfile
+import unicodedata
 from urllib.parse import quote
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
 
-JAMENDO = "https://api.jamendo.com/v3.0/tracks/"
+st.set_page_config(page_title="Free Music Finder", page_icon="🎵", layout="wide")
+st.title("🎵 Free Music Finder")
+st.caption("Find exact matches from free-download catalogs. No Spotify audio is extracted.")
+
+JAMENDO_API = "https://api.jamendo.com/v3.0/tracks/"
 IA_SEARCH = "https://archive.org/advancedsearch.php"
-IA_META = "https://archive.org/metadata/"
 
-st.set_page_config(page_title="My Audio Project", page_icon="🎵", layout="wide")
-st.title("🎵 My Audio Project")
-st.write("Search for exact matches that are available as free downloads.")
-st.info("This app does not convert Spotify tracks or bypass Spotify protections. It searches Jamendo and Internet Archive. Mainstream commercial recordings may not be available.")
+def norm(value):
+    value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
-def norm(s):
-    s = unicodedata.normalize("NFKD", str(s or ""))
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.casefold()).split())
+def find_col(df, choices):
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for choice in choices:
+        if choice in lookup:
+            return lookup[choice]
+    return None
 
-def text(v):
-    return " ".join(map(str, v)) if isinstance(v, list) else str(v or "")
+def read_playlists(upload):
+    playlists = []
+    with zipfile.ZipFile(upload) as zf:
+        for name in zf.namelist():
+            if not name.lower().endswith(".csv") or name.startswith("__MACOSX/"):
+                continue
+            try:
+                raw = zf.read(name)
+                df = pd.read_csv(io.BytesIO(raw))
+            except Exception:
+                continue
+            title_col = find_col(df, ["track name", "song title", "title", "track"])
+            artist_col = find_col(df, ["artist name", "artist", "artists"])
+            if title_col is None or artist_col is None:
+                continue
+            for _, row in df.iterrows():
+                title = str(row.get(title_col, "")).strip()
+                artist = str(row.get(artist_col, "")).strip()
+                if title and artist and title.lower() != "nan" and artist.lower() != "nan":
+                    playlists.append({
+                        "Playlist": Path(name).stem,
+                        "Requested track": title,
+                        "Requested artist": artist
+                    })
+    # Remove repeated CSV rows within the same playlist, keeping first occurrence.
+    seen, unique = set(), []
+    for item in playlists:
+        key = (norm(item["Playlist"]), norm(item["Requested track"]), norm(item["Requested artist"]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return pd.DataFrame(unique)
 
-def col(df, names):
-    d = {str(c).strip().lower(): c for c in df.columns}
-    return next((d[n] for n in names if n in d), None)
-
-def parse_csv(raw, filename):
-    df = pd.read_csv(io.BytesIO(raw))
-    tc = col(df, ["track name", "song title", "track", "title", "name"])
-    ac = col(df, ["artist name", "artist", "artists"])
-    if tc is None or ac is None:
-        return None, f"{filename}: title/artist columns not found."
-    out = pd.DataFrame({"Playlist": Path(filename).stem, "Track": df[tc], "Artist": df[ac]})
-    out = out.dropna()
-    out["Track"] = out["Track"].astype(str).str.strip()
-    out["Artist"] = out["Artist"].astype(str).str.strip()
-    return out[(out.Track != "") & (out.Artist != "")], None
-
-def read_uploads(items):
-    files = []
-    for item in items:
-        raw = item.getvalue()
-        if item.name.lower().endswith(".zip"):
-            with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                files.extend((Path(n).name, z.read(n)) for n in z.namelist()
-                              if n.lower().endswith(".csv") and not n.startswith("__MACOSX/"))
-        else:
-            files.append((item.name, raw))
-    return files
-
-def jamendo(client, track, artist):
-    p = {"client_id": client, "format": "json", "limit": 50, "search": track,
-         "artist_name": artist, "include": "licenses", "audiodlformat": "mp32"}
-    r = requests.get(JAMENDO, params=p, timeout=30); r.raise_for_status()
-    data = r.json()
-    if data.get("headers", {}).get("status") != "success":
-        raise RuntimeError(data.get("headers", {}).get("error_message", "Jamendo API error"))
-    out = []
-    for x in data.get("results", []):
-        if norm(x.get("name")) == norm(track) and norm(x.get("artist_name")) == norm(artist):
-            if x.get("audiodownload_allowed") and x.get("audiodownload"):
-                out.append({"source":"Jamendo", "title":x.get("name"), "artist":x.get("artist_name"),
-                            "license":x.get("license_ccurl",""), "url":x["audiodownload"],
-                            "page":f"https://www.jamendo.com/track/{x.get('id','')}"})
-    return out
-
-def ia_exact(track, artist):
-    q = f'mediatype:audio AND title:"{track}" AND creator:"{artist}"'
-    p = [("q",q),("output","json"),("rows",10),("fl[]","identifier")]
-    r = requests.get(IA_SEARCH, params=p, timeout=30); r.raise_for_status()
-    docs = r.json().get("response",{}).get("docs",[])
-    out = []
-    for d in docs:
-        ident = d.get("identifier")
-        if not ident: continue
-        mr = requests.get(IA_META + quote(ident), timeout=30); mr.raise_for_status()
-        data = mr.json(); m = data.get("metadata",{})
-        title, creator = text(m.get("title")), text(m.get("creator"))
-        lic = text(m.get("licenseurl") or m.get("license_url"))
-        low = lic.lower()
-        recognized = any(x in low for x in [
-            "creativecommons.org/publicdomain/zero/",
-            "creativecommons.org/publicdomain/mark/",
-            "creativecommons.org/licenses/by/",
-            "creativecommons.org/licenses/by-sa/",
-            "creativecommons.org/licenses/by-nc/",
-            "creativecommons.org/licenses/by-nc-sa/",
-            "creativecommons.org/licenses/by-nd/",
-            "creativecommons.org/licenses/by-nc-nd/",
-        ])
-        if norm(title) != norm(track) or norm(creator) != norm(artist) or not recognized:
+def jamendo_search(title, artist, client_id):
+    params = {
+        "client_id": client_id,
+        "format": "json",
+        "limit": 50,
+        "search": title,
+        "audioformat": "mp32",
+        "include": "licenses",
+    }
+    try:
+        response = requests.get(JAMENDO_API, params=params, timeout=25)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return []
+    matches, seen = [], set()
+    for track in data.get("results", []):
+        track_title = track.get("name", "")
+        track_artist = track.get("artist_name", "")
+        # Exact normalized title and artist required. No fuzzy or title-only matches.
+        if norm(track_title) != norm(title) or norm(track_artist) != norm(artist):
             continue
-        for f in data.get("files",[]):
-            name = f.get("name","")
-            if name.lower().endswith(".mp3") and not f.get("private"):
-                out.append({"source":"Internet Archive", "title":title, "artist":creator,
-                            "license":lic, "url":f"https://archive.org/download/{quote(ident)}/{quote(name)}",
-                            "page":f"https://archive.org/details/{quote(ident)}"})
-    return out
+        if not track.get("audiodownload_allowed") or not track.get("audiodownload"):
+            continue
+        track_id = str(track.get("id", ""))
+        if not track_id or track_id in seen:
+            continue
+        seen.add(track_id)
+        matches.append({
+            "Source": "Jamendo",
+            "Matched title": track_title,
+            "Matched artist": track_artist,
+            "License": track.get("license_ccurl") or "See Jamendo track page",
+            "Source page": track.get("shareurl") or "",
+            "Download URL": track.get("audiodownload"),
+            "Status": "Jamendo marks audio download as allowed"
+        })
+    return matches
 
-client = st.text_input("Jamendo API client ID", type="password")
-sources = st.multiselect("Sources", ["Jamendo","Internet Archive"], ["Jamendo","Internet Archive"])
-uploads = st.file_uploader("Upload separated playlist CSVs or their ZIP", type=["csv","zip"], accept_multiple_files=True)
+def archive_discovery(title, artist):
+    # Internet Archive is discovery-only. Its uploader-supplied metadata/license
+    # cannot independently prove rights, so no IA item is ever download-eligible.
+    query = f'mediatype:audio AND title:"{title}" AND creator:"{artist}"'
+    params = {"q": query, "fl[]": ["identifier", "title", "creator"], "rows": 20, "output": "json"}
+    try:
+        response = requests.get(IA_SEARCH, params=params, timeout=25)
+        response.raise_for_status()
+        docs = response.json().get("response", {}).get("docs", [])
+    except Exception:
+        return []
+    found, seen = [], set()
+    for doc in docs:
+        identifier = str(doc.get("identifier", ""))
+        if not identifier or identifier in seen:
+            continue
+        title_value = doc.get("title", "")
+        creator_value = doc.get("creator", "")
+        if isinstance(title_value, list):
+            title_value = title_value[0] if title_value else ""
+        if isinstance(creator_value, list):
+            creator_value = creator_value[0] if creator_value else ""
+        if norm(title_value) != norm(title) or norm(creator_value) != norm(artist):
+            continue
+        seen.add(identifier)
+        found.append({
+            "Source": "Internet Archive (unverified)",
+            "Matched title": title_value,
+            "Matched artist": creator_value,
+            "License": "Uploader metadata only; not independently verified",
+            "Source page": f"https://archive.org/details/{quote(identifier)}",
+            "Download URL": "",
+            "Status": "Discovery only. Not eligible for download."
+        })
+    return found
 
-if uploads:
-    frames=[]
-    for filename, raw in read_uploads(uploads):
-        try:
-            frame, err = parse_csv(raw, filename)
-            if err: st.warning(err)
-            elif frame is not None: frames.append(frame)
-        except Exception as e: st.warning(f"{filename}: {e}")
-    if frames:
-        library = pd.concat(frames, ignore_index=True).drop_duplicates()
-        st.success(f"Loaded {len(library)} tracks from {library.Playlist.nunique()} playlist files.")
-        st.dataframe(library.head(20), use_container_width=True, hide_index=True)
-        names = ["All playlists"] + sorted(library.Playlist.unique())
-        chosen = st.selectbox("Choose a playlist", names)
-        view = library if chosen == "All playlists" else library[library.Playlist == chosen]
-        count = st.number_input("Maximum tracks to search", 1, min(100,len(view)), min(10,len(view)))
-        st.caption("Only exact normalized title + artist/creator matches are eligible. Internet Archive results also need an explicit recognized open/public-domain license and an MP3 file.")
-        if st.button("Search selected free sources", type="primary", disabled=not sources):
-            results=[]
-            progress=st.progress(0); status=st.empty()
-            for i,row in view.head(int(count)).reset_index(drop=True).iterrows():
-                status.write(f"Searching {i+1}/{count}: {row.Track} - {row.Artist}")
-                found=False
-                if "Jamendo" in sources:
-                    if client:
-                        try:
-                            for x in jamendo(client,row.Track,row.Artist):
-                                found=True; results.append({"Playlist":row.Playlist,"Requested track":row.Track,"Requested artist":row.Artist,**x,"Match status":"Exact match; download permitted","Download allowed":"Yes"})
-                        except Exception as e:
-                            results.append({"Playlist":row.Playlist,"Requested track":row.Track,"Requested artist":row.Artist,"source":"Jamendo","Match status":f"Search error: {e}","Download allowed":"No"})
-                    else:
-                        results.append({"Playlist":row.Playlist,"Requested track":row.Track,"Requested artist":row.Artist,"source":"Jamendo","Match status":"Skipped: Client ID required","Download allowed":"No"})
-                if "Internet Archive" in sources:
-                    try:
-                        for x in ia_exact(row.Track,row.Artist):
-                            found=True; results.append({"Playlist":row.Playlist,"Requested track":row.Track,"Requested artist":row.Artist,**x,"Match status":"Exact match; open license listed","Download allowed":"Yes"})
-                    except Exception as e:
-                        results.append({"Playlist":row.Playlist,"Requested track":row.Track,"Requested artist":row.Artist,"source":"Internet Archive","Match status":f"Search error: {e}","Download allowed":"No"})
-                if not found:
-                    results.append({"Playlist":row.Playlist,"Requested track":row.Track,"Requested artist":row.Artist,"source":"Combined search","Match status":"No eligible exact free match found","Download allowed":"No"})
-                progress.progress((i+1)/int(count))
-            status.success("Search finished. Review each source page and license before downloading.")
-            st.session_state["results"] = pd.DataFrame(results)
+with st.sidebar:
+    st.header("Settings")
+    client_id = st.text_input("Jamendo Client ID", type="password", help="Enter your own Jamendo Client ID. It is not stored in this app.")
+    include_ia = st.checkbox("Show Internet Archive discovery results (not downloadable)", value=False)
+    max_tracks = st.selectbox("Tracks to test", [10, 25, 50, 100, "All"], index=0)
 
-if "results" in st.session_state:
-    df=st.session_state["results"]
-    st.subheader("Search results")
-    st.metric("Eligible free-download results", int((df.get("Download allowed")=="Yes").sum()))
-    show=df.drop(columns=["url"], errors="ignore")
-    st.dataframe(show,use_container_width=True,hide_index=True)
-    st.download_button("Download results CSV",show.to_csv(index=False).encode("utf-8-sig"),
-                       "free_music_search_results.csv","text/csv")
-    st.subheader("Eligible downloads")
-    eligible=df[df.get("Download allowed")=="Yes"]
-    if eligible.empty:
-        st.info("No eligible exact free downloads found. No unrelated tracks will be substituted.")
+upload = st.file_uploader("Upload your Spotify playlist CSV ZIP", type=["zip"])
+if upload:
+    try:
+        tracks_df = read_playlists(upload)
+    except Exception as exc:
+        st.error(f"Could not read ZIP: {exc}")
+        tracks_df = pd.DataFrame()
+    if tracks_df.empty:
+        st.error("No usable CSV tracks found. CSVs need columns such as Track name and Artist name.")
     else:
-        for i,x in eligible.iterrows():
-            with st.expander(f"{x.get('title','')} - {x.get('artist','')} ({x.get('source','')})"):
-                st.write("Playlist:",x.get("Playlist",""))
-                st.write("License:",x.get("license",""))
-                st.markdown(f"[Open source item]({x.get('page','')})")
-                st.warning("Review the source item and license terms before downloading.")
-                try:
-                    r=requests.get(x["url"],timeout=90); r.raise_for_status()
-                    fn=x["url"].split("/")[-1]
-                    st.download_button("Download authorized MP3",r.content,fn or "audio.mp3","audio/mpeg",key=f"dl{i}")
-                except Exception as e: st.warning(f"Download unavailable: {e}")
+        st.success(f"Loaded {len(tracks_df):,} unique tracks from {tracks_df['Playlist'].nunique()} playlists.")
+        playlist_names = sorted(tracks_df["Playlist"].unique().tolist())
+        selected = st.multiselect("Choose playlist(s)", playlist_names, default=playlist_names[:1])
+        subset = tracks_df[tracks_df["Playlist"].isin(selected)].copy()
+        if max_tracks != "All":
+            subset = subset.head(int(max_tracks))
+        st.write(f"Tracks queued for search: **{len(subset)}**")
+        if st.button("Search selected free sources", type="primary", disabled=not client_id.strip()):
+            if not client_id.strip():
+                st.warning("Enter your Jamendo Client ID in the sidebar.")
+            else:
+                rows, eligible, discovery = [], [], []
+                progress = st.progress(0)
+                status = st.empty()
+                total = max(len(subset), 1)
+                for index, (_, item) in enumerate(subset.iterrows(), start=1):
+                    title, artist = item["Requested track"], item["Requested artist"]
+                    jamendo = jamendo_search(title, artist, client_id.strip())
+                    ia = archive_discovery(title, artist) if include_ia else []
+                    if jamendo:
+                        for match in jamendo:
+                            record = {**item.to_dict(), **match, "Download allowed": "Yes"}
+                            eligible.append(record)
+                        rows.append({**item.to_dict(), "Source": "Jamendo", "Match status": f"{len(jamendo)} exact downloadable match(es)", "Download allowed": "Yes"})
+                    elif ia:
+                        for match in ia:
+                            discovery.append({**item.to_dict(), **match, "Download allowed": "No"})
+                        rows.append({**item.to_dict(), "Source": "Internet Archive", "Match status": "Unverified discovery result only", "Download allowed": "No"})
+                    else:
+                        rows.append({**item.to_dict(), "Source": "Jamendo" + (" + Internet Archive" if include_ia else ""), "Match status": "No eligible exact free match found", "Download allowed": "No"})
+                    progress.progress(index / total)
+                    status.caption(f"Checked {index} of {total}: {title} - {artist}")
+                st.session_state["search_rows"] = rows
+                st.session_state["eligible_rows"] = eligible
+                st.session_state["discovery_rows"] = discovery
+                st.session_state["search_key"] = (tuple(selected), len(subset))
+                status.success("Search finished. Jamendo download permissions are shown as reported by Jamendo. Review source pages and license terms.")
+                progress.empty()
+
+if "search_rows" in st.session_state:
+    st.subheader("Search results")
+    results = pd.DataFrame(st.session_state["search_rows"])
+    st.metric("Tracks checked", len(results))
+    st.dataframe(results, use_container_width=True, hide_index=True)
+    st.download_button("Download results CSV", results.to_csv(index=False).encode("utf-8-sig"), "music_search_results.csv", "text/csv")
+    eligible = st.session_state.get("eligible_rows", [])
+    st.subheader("Jamendo exact-match downloads")
+    if eligible:
+        for i, item in enumerate(eligible):
+            with st.expander(f"{item['Matched title']} - {item['Matched artist']} (Jamendo)"):
+                st.write(f"Playlist: {item['Playlist']}")
+                st.write(f"License: {item['License']}")
+                if item["Source page"]:
+                    st.markdown(f"[Open Jamendo source page]({item['Source page']})")
+                st.warning("Jamendo reports that downloads are allowed for this track. Review the track page and license before use.")
+                st.link_button("Open Jamendo download", item["Download URL"])
+    else:
+        st.info("No exact Jamendo matches with download permission were found.")
+    discovery = st.session_state.get("discovery_rows", [])
+    if discovery:
+        st.subheader("Internet Archive discovery only (not eligible for download)")
+        st.warning("These are unverified uploader listings. No MP3 download links are provided.")
+        df_discovery = pd.DataFrame(discovery)
+        st.dataframe(df_discovery.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+        for item in discovery:
+            st.markdown(f"- [{item['Matched title']} - {item['Matched artist']}]({item['Source page']})")
+
+st.caption("Important: exact metadata matches do not establish copyright ownership. Internet Archive listings are never treated as authorized downloads by this app. Jamendo download eligibility is based on Jamendo's API permission flag and should still be checked on the source page.")
