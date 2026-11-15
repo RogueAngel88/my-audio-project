@@ -177,8 +177,18 @@ if uploads:
                             eligible.append(record)
                         rows.append({**item.to_dict(), "Source": "Jamendo", "Match status": f"{len(jamendo)} exact downloadable match(es)", "Download allowed": "Yes"})
                     elif ia:
+                        # Collapse multiple Archive uploads for the same requested
+                        # title/artist into one discovery row. Keep one source page
+                        # and report how many distinct archive records matched.
+                        unique_archive = {}
                         for match in ia:
-                            discovery.append({**item.to_dict(), **match, "Download allowed": "No"})
+                            key = (norm(match.get("Matched title", "")), norm(match.get("Matched artist", "")))
+                            if key not in unique_archive:
+                                unique_archive[key] = match
+                        for match in unique_archive.values():
+                            record = {**item.to_dict(), **match, "Download allowed": "No"}
+                            record["Additional archive records"] = max(len(ia) - 1, 0)
+                            discovery.append(record)
                         rows.append({**item.to_dict(), "Source": "Internet Archive", "Match status": "Unverified discovery result only", "Download allowed": "No"})
                     else:
                         rows.append({**item.to_dict(), "Source": "Jamendo" + (" + Internet Archive" if include_ia else ""), "Match status": "No eligible exact free match found", "Download allowed": "No"})
@@ -215,8 +225,18 @@ if "search_rows" in st.session_state:
         st.subheader("Internet Archive discovery only (not eligible for download)")
         st.warning("These are unverified uploader listings. No MP3 download links are provided.")
         df_discovery = pd.DataFrame(discovery)
+        if not df_discovery.empty:
+            df_discovery = df_discovery.drop_duplicates(
+                subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Matched artist"],
+                keep="first"
+            )
         st.dataframe(df_discovery.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+        shown_links = set()
         for item in discovery:
-            st.markdown(f"- [{item['Matched title']} - {item['Matched artist']}]({item['Source page']})")
+            link_key = (norm(item["Requested track"]), norm(item["Requested artist"]))
+            if link_key in shown_links:
+                continue
+            shown_links.add(link_key)
+            st.markdown(f"- [{item['Requested track']} - {item['Requested artist']}]({item['Source page']})")
 
 st.caption("Important: exact metadata matches do not establish copyright ownership. Internet Archive listings are never treated as authorized downloads by this app. Jamendo download eligibility is based on Jamendo's API permission flag and should still be checked on the source page.")
