@@ -11,7 +11,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Free Music Finder", page_icon="🎵", layout="wide")
 st.title("🎵 Free Music Finder")
-st.caption("Find exact matches from free-download catalogs. No Spotify audio is extracted.")
+st.caption("Find candidate matches for original recordings. No Spotify audio is extracted.")
+st.info("Original recordings only: covers, remixes, mashups, karaoke, tribute, acoustic, and instrumental versions are not accepted. Metadata alone cannot prove recording identity, so every candidate requires your manual listening check before downloading.")
 
 JAMENDO_API = "https://api.jamendo.com/v3.0/tracks/"
 IA_SEARCH = "https://archive.org/advancedsearch.php"
@@ -99,7 +100,7 @@ def jamendo_search(title, artist, client_id):
             "License": track.get("license_ccurl") or "See Jamendo track page",
             "Source page": track.get("shareurl") or "",
             "Download URL": track.get("audiodownload"),
-            "Status": "Jamendo marks audio download as allowed"
+            "Status": "Exact metadata + Jamendo download permission; original recording still needs manual verification"
         })
     return matches
 
@@ -391,7 +392,7 @@ if uploads:
                         for match in jamendo:
                             record = {**item.to_dict(), **match, "Download allowed": "Yes"}
                             eligible.append(record)
-                        rows.append({**item.to_dict(), "Source": "Jamendo", "Match status": f"{len(jamendo)} exact downloadable match(es)", "Download allowed": "Yes"})
+                        rows.append({**item.to_dict(), "Source": "Jamendo", "Match status": f"{len(jamendo)} exact metadata candidate(s); original recording not yet verified", "Download allowed": "Pending manual original-recording check"})
                     elif ia:
                         # Collapse multiple Archive uploads for the same requested
                         # title/artist into one discovery row. Keep one source page
@@ -426,7 +427,7 @@ if uploads:
                 st.session_state["openverse_rows"] = openverse_results
                 st.session_state["ccmixter_diagnostics"] = cc_diag
                 st.session_state["search_key"] = (tuple(selected), len(subset))
-                status.success("Search finished. Jamendo download permissions are shown as reported by Jamendo. Review source pages and license terms.")
+                status.success("Search finished. Only exact Jamendo metadata candidates are listed for manual original-recording verification. Other catalogs remain discovery-only.")
                 progress.empty()
 
 if "search_rows" in st.session_state:
@@ -436,7 +437,7 @@ if "search_rows" in st.session_state:
     st.dataframe(results, use_container_width=True, hide_index=True)
     st.download_button("Download results CSV", results.to_csv(index=False).encode("utf-8-sig"), "music_search_results.csv", "text/csv")
     eligible = st.session_state.get("eligible_rows", [])
-    st.subheader("Jamendo exact-match downloads")
+    st.subheader("Jamendo exact-match candidates (original recording check required)")
     if eligible:
         for i, item in enumerate(eligible):
             with st.expander(f"{item['Matched title']} - {item['Matched artist']} (Jamendo)"):
@@ -444,10 +445,18 @@ if "search_rows" in st.session_state:
                 st.write(f"License: {item['License']}")
                 if item["Source page"]:
                     st.markdown(f"[Open Jamendo source page]({item['Source page']})")
-                st.warning("Jamendo reports that downloads are allowed for this track. Review the track page and license before use.")
-                st.link_button("Open Jamendo download", item["Download URL"])
+                st.warning("Jamendo reports that downloads are allowed, but exact title/artist metadata does NOT prove this is the original studio recording. Listen to the full track and compare it with the original recording you intend to collect. Check the license and permitted use on the source page.")
+                verified_key = f"original_verified_{i}"
+                confirmed = st.checkbox(
+                    "I listened and confirmed this is the original recording, not a cover, remix, tribute, karaoke, acoustic, or instrumental version.",
+                    key=verified_key,
+                )
+                if confirmed:
+                    st.link_button("Open Jamendo download", item["Download URL"])
+                else:
+                    st.caption("Download link is hidden until you confirm the recording identity.")
     else:
-        st.info("No exact Jamendo matches with download permission were found.")
+        st.info("No exact Jamendo metadata candidates with download permission were found.")
     discovery = st.session_state.get("discovery_rows", [])
     if discovery:
         st.subheader("Internet Archive discovery only (not eligible for download)")
@@ -469,7 +478,7 @@ if "search_rows" in st.session_state:
     openverse_rows = st.session_state.get("openverse_rows", [])
     st.subheader("Openverse openly licensed audio discovery (not pre-approved for download)")
     if openverse_rows:
-        st.warning("Openverse indexes openly licensed media, but a license label does not prove the uploader owns the recording or that it is the requested original/authorized cover. No direct MP3 download links are provided. Open each source page and review the license and attribution requirements.")
+        st.warning("Openverse results are discovery-only. They are not accepted as original recordings or downloadable tracks. Covers, remixes, karaoke, tribute, acoustic, and instrumental versions are excluded from the collection.")
         ov_df = pd.DataFrame(openverse_rows).drop_duplicates(
             subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Creator", "Source page"],
             keep="first"
@@ -494,7 +503,7 @@ if "search_rows" in st.session_state:
     cc_rows = st.session_state.get("ccmixter_rows", [])
     st.subheader("ccMixter discovery (license review required)")
     if cc_rows:
-        st.warning("All ccMixter records are discovery-only. Same title alone does not establish that a recording is a cover or remix. Possible cover/remix labels require the source description/tags to mention both the requested artist and a relationship such as 'cover of' or 'remix of'. Verify the actual audio and license on the source page. No MP3 download links are provided.")
+        st.warning("ccMixter results are discovery-only and are not eligible for your original-recordings-only collection. Do not use covers, remixes, tribute, karaoke, acoustic, or instrumental versions.")
         cc_df = pd.DataFrame(cc_rows).drop_duplicates(
             subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Uploader username", "Category"],
             keep="first"
@@ -539,4 +548,4 @@ if "search_rows" in st.session_state:
         if cc_diag.get("error"):
             st.error(cc_diag["error"])
 
-st.caption("Important: exact metadata matches do not establish copyright ownership or recording identity. Internet Archive, Openverse, and ccMixter listings are discovery-only and are never treated as authorized downloads by this app. Jamendo download eligibility is based on Jamendo's API permission flag and should still be checked on the source page.")
+st.caption("Important: this app cannot independently authenticate a master recording from metadata. Jamendo candidates require your listening confirmation and license review before download. Internet Archive, Openverse, and ccMixter are discovery-only and never provide download approval here. Original recordings only: no covers, remixes, mashups, tribute, karaoke, acoustic, or instrumental versions.")
