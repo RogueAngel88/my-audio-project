@@ -198,16 +198,42 @@ def ccmixter_discovery(title, artist):
         license_url = str(lower.get("license_url") or "").strip()
         item_url = str(lower.get("file_page_url") or "").strip()
 
-        # Only consider same-title records. Do not call a different uploader
-        # the requested artist; classify it as an unverified alternative.
+        description = str(
+            lower.get("upload_description_plain")
+            or lower.get("upload_description_html")
+            or ""
+        ).strip()
+        tags = str(lower.get("upload_tags") or "").strip()
+        evidence_text = f"{description} {tags}".lower()
+
+        # Only consider exact same-title records. A different uploader is NOT
+        # automatically a cover/remix. Require explicit text connecting the
+        # requested artist to a cover/remix/version before calling it possible.
         if not name or norm(name) != norm(title):
             continue
 
-        match_type = (
-            "Exact title + artist/display-name match"
-            if norm(display_name) == norm(artist) or norm(username) == norm(artist)
-            else "Unverified alternative: same title, different uploader"
+        same_artist_metadata = (
+            norm(display_name) == norm(artist) or norm(username) == norm(artist)
         )
+        artist_mentioned = norm(artist).lower() in evidence_text
+        relationship_terms = (
+            "cover", "remix of", "remix for", "version of",
+            "tribute to", "cover of", "re-recording of", "re-recorded"
+        )
+        relationship_mentioned = any(term in evidence_text for term in relationship_terms)
+
+        if same_artist_metadata:
+            match_type = "Exact title + artist/uploader metadata match (unverified)"
+            category = "Exact metadata match"
+            classification_reason = "Uploader/display metadata matches the requested artist; recording identity still needs source-page verification."
+        elif artist_mentioned and relationship_mentioned:
+            match_type = "Possible cover/remix: source text mentions artist and relationship"
+            category = "Possible cover/remix (unverified)"
+            classification_reason = "Source description/tags mention the requested artist and a cover/remix relationship. Verify the actual audio and rights."
+        else:
+            match_type = "Unrelated or unverified same-title recording"
+            category = "Same title only (not a confirmed alternative)"
+            classification_reason = "No clear source-page text connecting this upload to the requested artist's song."
         identity = (upload_id or norm(name), norm(username), match_type)
         if identity in seen:
             continue
@@ -218,7 +244,9 @@ def ccmixter_discovery(title, artist):
             "Matched title": name,
             "Uploader username": username,
             "Uploader/display name": display_name,
+            "Category": category,
             "Match type": match_type,
+            "Classification reason": classification_reason,
             "License": license_name,
             "License URL": license_url,
             "Source page": item_url,
@@ -229,10 +257,13 @@ def ccmixter_discovery(title, artist):
 
     diagnostics["same_title_records"] = len(found)
     diagnostics["exact_title_artist_matches"] = sum(
-        1 for item in found if item["Match type"] == "Exact title + artist/display-name match"
+        1 for item in found if item["Category"] == "Exact metadata match"
     )
-    diagnostics["alternative_records"] = sum(
-        1 for item in found if item["Match type"].startswith("Unverified alternative")
+    diagnostics["possible_cover_remix_records"] = sum(
+        1 for item in found if item["Category"] == "Possible cover/remix (unverified)"
+    )
+    diagnostics["same_title_only_records"] = sum(
+        1 for item in found if item["Category"] == "Same title only (not a confirmed alternative)"
     )
     return found, diagnostics
 
@@ -354,23 +385,30 @@ if "search_rows" in st.session_state:
     cc_rows = st.session_state.get("ccmixter_rows", [])
     st.subheader("ccMixter discovery (license review required)")
     if cc_rows:
-        st.warning("All ccMixter records are discovery-only. A same-title result from a different uploader is not proof that it is an authorized cover or remix of the requested song. Open the item page and review the recording, license, attribution, and restrictions. No MP3 download links are provided.")
+        st.warning("All ccMixter records are discovery-only. Same title alone does not establish that a recording is a cover or remix. Possible cover/remix labels require the source description/tags to mention both the requested artist and a relationship such as 'cover of' or 'remix of'. Verify the actual audio and license on the source page. No MP3 download links are provided.")
         cc_df = pd.DataFrame(cc_rows).drop_duplicates(
-            subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Uploader username", "Match type"],
+            subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Uploader username", "Category"],
             keep="first"
         )
-        exact_cc = cc_df[cc_df["Match type"] == "Exact title + artist/display-name match"]
-        alternative_cc = cc_df[cc_df["Match type"].str.startswith("Unverified alternative")]
-        st.markdown("**Exact title + artist/display-name matches**")
+        exact_cc = cc_df[cc_df["Category"] == "Exact metadata match"]
+        possible_cc = cc_df[cc_df["Category"] == "Possible cover/remix (unverified)"]
+        same_title_cc = cc_df[cc_df["Category"] == "Same title only (not a confirmed alternative)"]
+
+        st.markdown("**Exact title + artist/uploader metadata matches (still unverified)**")
         if not exact_cc.empty:
             st.dataframe(exact_cc.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
         else:
-            st.info("No exact title + artist/display-name matches.")
-        st.markdown("**Possible alternatives: same title, different uploader**")
-        if not alternative_cc.empty:
-            st.dataframe(alternative_cc.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+            st.info("No exact title + artist/uploader metadata matches.")
+        st.markdown("**Possible covers/remixes (source text provides a clue, not proof)**")
+        if not possible_cc.empty:
+            st.dataframe(possible_cc.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
         else:
-            st.info("No same-title alternative uploads were returned.")
+            st.info("No source descriptions/tags explicitly connected a same-title upload to the requested artist.")
+        st.markdown("**Same title only (not a confirmed alternative)**")
+        if not same_title_cc.empty:
+            st.dataframe(same_title_cc.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+        else:
+            st.info("No unrelated same-title records were returned.")
         for item in cc_df.to_dict("records"):
             if item.get("Source page"):
                 st.markdown(f"- [{item['Matched title']} - {item['Uploader/display name'] or item['Uploader username']}]({item['Source page']}) · {item['Match type']}")
@@ -381,8 +419,9 @@ if "search_rows" in st.session_state:
         st.write(f"HTTP status: {cc_diag.get('api_status', 'not available')}")
         st.write(f"CSV rows received for the last checked track: {cc_diag.get('rows_received', 0)}")
         st.write(f"Same-title records: {cc_diag.get('same_title_records', 0)}")
-        st.write(f"Exact title + artist/display-name matches: {cc_diag.get('exact_title_artist_matches', 0)}")
-        st.write(f"Possible alternatives (different uploader): {cc_diag.get('alternative_records', 0)}")
+        st.write(f"Exact title + artist/uploader metadata matches: {cc_diag.get('exact_title_artist_matches', 0)}")
+        st.write(f"Possible cover/remix clues: {cc_diag.get('possible_cover_remix_records', 0)}")
+        st.write(f"Same-title-only records: {cc_diag.get('same_title_only_records', 0)}")
         if cc_diag.get("columns"):
             st.write("Returned columns:", ", ".join(str(c) for c in cc_diag["columns"]))
         if cc_diag.get("sample_rows"):
