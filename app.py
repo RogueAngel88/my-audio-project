@@ -139,39 +139,65 @@ def archive_discovery(title, artist):
     return found
 
 
+
 def ccmixter_discovery(title, artist):
     """
-    Search ccMixter's public Query API. Results remain discovery-only until
-    the individual upload page and its specific license/download terms are
-    reviewed. The API's license field is a useful claim, not independent
-    proof of ownership or a guarantee that every use is permitted.
+    Search ccMixter's documented Query API. Search by exact title phrase first,
+    then compare returned title/artist fields locally. ccMixter API metadata
+    fields vary by dataview, so retain diagnostics rather than silently
+    treating a parse failure as 'no matches'.
     """
     params = {
         "f": "csv",
         "dataview": "default",
-        "limit": 30,
-        "search": f'"{title}" "{artist}"',
-        "search_type": "all",
+        "limit": 50,
+        "search": title,
+        "search_type": "match",
     }
+    diagnostics = {"api_status": "not checked", "columns": [], "rows_received": 0, "error": ""}
     try:
-        response = requests.get(CCMIXTER_API, params=params, timeout=25,
-                                headers={"User-Agent": "FreeMusicFinder/1.0"})
+        response = requests.get(
+            CCMIXTER_API,
+            params=params,
+            timeout=25,
+            headers={"User-Agent": "FreeMusicFinder/1.0"}
+        )
+        diagnostics["api_status"] = str(response.status_code)
         response.raise_for_status()
-        text_data = response.content.decode("utf-8-sig", errors="replace")
+        text_data = response.content.decode("utf-8-sig", errors="replace").strip()
+        if not text_data:
+            diagnostics["error"] = "The API returned an empty response."
+            return [], diagnostics
         rows = list(csv.DictReader(io.StringIO(text_data)))
-    except Exception:
-        return []
+        if not rows:
+            diagnostics["error"] = "The response contained no CSV data rows."
+            return [], diagnostics
+        diagnostics["columns"] = list(rows[0].keys())
+        diagnostics["rows_received"] = len(rows)
+    except Exception as exc:
+        diagnostics["error"] = f"{type(exc).__name__}: {exc}"
+        return [], diagnostics
 
     found, seen = [], set()
     for row in rows:
         lower = {str(k).strip().lower(): v for k, v in row.items() if k}
-        # ccHost dataview field names can vary by installation/version.
-        name = next((lower[k] for k in ("upload_name", "name", "title") if lower.get(k)), "")
-        creator = next((lower[k] for k in ("user_real_name", "artist", "artist_name", "user", "upload_user") if lower.get(k)), "")
-        upload_id = next((lower[k] for k in ("upload_id", "id") if lower.get(k)), "")
-        license_code = next((lower[k] for k in ("upload_license", "license", "lic") if lower.get(k)), "")
+        name = next((lower[k] for k in (
+            "upload_name", "name", "title", "upload_title"
+        ) if lower.get(k)), "")
+        creator = next((lower[k] for k in (
+            "user_real_name", "artist", "artist_name", "fullname",
+            "user_full_name", "upload_artist", "user_name", "user"
+        ) if lower.get(k)), "")
+        upload_id = next((lower[k] for k in (
+            "upload_id", "id"
+        ) if lower.get(k)), "")
+        license_code = next((lower[k] for k in (
+            "upload_license", "license", "lic"
+        ) if lower.get(k)), "")
+
         if norm(name) != norm(title) or norm(creator) != norm(artist):
             continue
+
         identity = str(upload_id or f"{norm(name)}|{norm(creator)}")
         if identity in seen:
             continue
@@ -189,23 +215,29 @@ def ccmixter_discovery(title, artist):
             "ncsplus": "NonCommercial Sampling+",
             "pd": "Public Domain",
         }
-        license_label = license_names.get(str(license_code).lower(), f"License code: {license_code or 'not returned'}")
-        # Construct a source search link rather than guessing an individual
-        # upload URL or MP3 URL from incomplete API metadata.
-        search_url = "https://ccmixter.org/api/query?" + requests.compat.urlencode({
-            "f": "page", "t": "search_uploads", "limit": 30,
-            "search_type": "all", "search": f'"{title}" "{artist}"'
-        })
+        license_label = license_names.get(
+            str(license_code).lower(),
+            f"License code: {license_code or 'not returned'}"
+        )
+        item_url = (
+            f"https://ccmixter.org/files/{quote(str(creator))}/{quote(str(upload_id))}"
+            if upload_id else
+            "https://ccmixter.org/api/query?" + requests.compat.urlencode({
+                "f": "page", "t": "search_uploads", "limit": 30,
+                "search_type": "match", "search": title
+            })
+        )
         found.append({
             "Source": "ccMixter (discovery)",
             "Matched title": name,
             "Matched artist": creator,
             "License": license_label,
-            "Source page": search_url,
+            "Source page": item_url,
             "Download URL": "",
-            "Status": "Discovery only. Open the item and verify its license and download terms."
+            "Status": "Discovery only. Review the individual upload page and license."
         })
-    return found
+    diagnostics["exact_matches"] = len(found)
+    return found, diagnostics
 
 with st.sidebar:
     st.header("Settings")
@@ -243,7 +275,7 @@ if uploads:
                     title, artist = item["Requested track"], item["Requested artist"]
                     jamendo = jamendo_search(title, artist, client_id.strip())
                     ia = archive_discovery(title, artist) if include_ia else []
-                    cc = ccmixter_discovery(title, artist) if include_ccmixter else []
+                    cc, cc_diag = ccmixter_discovery(title, artist) if include_ccmixter else ([], {"api_status": "disabled", "columns": [], "rows_received": 0, "error": ""})
                     for match in cc:
                         ccmixter_results.append({**item.to_dict(), **match, "Download allowed": "No"})
                     if jamendo:
@@ -280,6 +312,7 @@ if uploads:
                 st.session_state["eligible_rows"] = eligible
                 st.session_state["discovery_rows"] = discovery
                 st.session_state["ccmixter_rows"] = ccmixter_results
+                st.session_state["ccmixter_diagnostics"] = cc_diag
                 st.session_state["search_key"] = (tuple(selected), len(subset))
                 status.success("Search finished. Jamendo download permissions are shown as reported by Jamendo. Review source pages and license terms.")
                 progress.empty()
@@ -333,6 +366,15 @@ if "search_rows" in st.session_state:
         for item in cc_df.to_dict("records"):
             st.markdown(f"- [{item['Matched title']} - {item['Matched artist']}]({item['Source page']})")
     else:
-        st.info("No exact ccMixter matches were returned for this test, or the API did not return parseable results.")
+        st.info("No exact ccMixter matches were returned for this test.")
+    cc_diag = st.session_state.get("ccmixter_diagnostics", {})
+    with st.expander("ccMixter API diagnostics"):
+        st.write(f"HTTP status: {cc_diag.get('api_status', 'not available')}")
+        st.write(f"CSV rows received for the last checked track: {cc_diag.get('rows_received', 0)}")
+        st.write(f"Exact matches: {cc_diag.get('exact_matches', 0)}")
+        if cc_diag.get("columns"):
+            st.write("Returned columns:", ", ".join(str(c) for c in cc_diag["columns"]))
+        if cc_diag.get("error"):
+            st.error(cc_diag["error"])
 
 st.caption("Important: exact metadata matches do not establish copyright ownership. Internet Archive listings are never treated as authorized downloads by this app. Jamendo download eligibility is based on Jamendo's API permission flag and should still be checked on the source page.")
