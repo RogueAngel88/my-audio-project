@@ -16,6 +16,7 @@ st.caption("Find exact matches from free-download catalogs. No Spotify audio is 
 JAMENDO_API = "https://api.jamendo.com/v3.0/tracks/"
 IA_SEARCH = "https://archive.org/advancedsearch.php"
 CCMIXTER_API = "https://ccmixter.org/api/query"
+OPENVERSE_API = "https://api.openverse.org/v1/audio/"
 
 def norm(value):
     value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode()
@@ -139,6 +140,82 @@ def archive_discovery(title, artist):
     return found
 
 
+
+
+def openverse_discovery(title, artist):
+    """Search Openverse for exact-title openly licensed audio candidates.
+
+    Results are discovery-only. Openverse metadata and a listed license do not
+    independently establish that the uploader owns the recording or that it is
+    the requested original recording/authorized cover. No direct audio URLs are
+    exposed as download buttons.
+    """
+    params = {
+        "title": title,
+        "category": "music",
+        "extension": "mp3",
+        "filter_dead": "true",
+        "page_size": 20,
+    }
+    try:
+        response = requests.get(
+            OPENVERSE_API,
+            params=params,
+            timeout=25,
+            headers={"User-Agent": "FreeMusicFinder/1.0"}
+        )
+        response.raise_for_status()
+        payload = response.json()
+        results = payload.get("results", [])
+    except Exception:
+        return []
+
+    found, seen = [], set()
+    for item in results:
+        matched_title = str(item.get("title") or "").strip()
+        creator = str(item.get("creator") or "").strip()
+        if not matched_title or norm(matched_title) != norm(title):
+            continue
+        item_id = str(item.get("id") or item.get("foreign_landing_url") or "")
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+
+        tags = item.get("tags") or []
+        tag_text = " ".join(
+            str(tag.get("name", "") if isinstance(tag, dict) else tag)
+            for tag in tags
+        ).lower()
+        evidence = f"{matched_title} {tag_text}".lower()
+        if norm(creator) == norm(artist):
+            category = "Exact title + creator metadata (unverified)"
+            match_type = "Creator metadata matches requested artist; recording identity still unverified"
+        elif any(term in evidence for term in ("cover", "tribute", "remix", "karaoke", "instrumental")):
+            category = "Possible cover/remix or alternate version (unverified)"
+            match_type = "Title and tags suggest an alternate version; verify recording and rights"
+        else:
+            category = "Same title only (not a confirmed alternative)"
+            match_type = "Creator differs or is missing; no reliable relationship to requested artist established"
+
+        license_name = str(item.get("license") or "Not provided")
+        license_version = str(item.get("license_version") or "")
+        if license_version:
+            license_name = f"{license_name} {license_version}"
+        found.append({
+            "Source": "Openverse (discovery only)",
+            "Matched title": matched_title,
+            "Creator": creator or "Not provided",
+            "Category": category,
+            "Match type": match_type,
+            "License": license_name,
+            "License URL": str(item.get("license_url") or ""),
+            "Provider": str(item.get("provider") or item.get("source") or "Not provided"),
+            "Source page": str(item.get("foreign_landing_url") or item.get("detail_url") or ""),
+            "Download URL": "",
+            "Download allowed": "No",
+            "Status": "Discovery only. Review the source page, license, attribution, and recording identity."
+        })
+    return found
 
 
 def ccmixter_discovery(title, artist):
@@ -272,6 +349,7 @@ with st.sidebar:
     client_id = st.text_input("Jamendo Client ID", type="password", help="Enter your own Jamendo Client ID. It is not stored in this app.")
     include_ia = st.checkbox("Show Internet Archive discovery results (not downloadable)", value=False)
     include_ccmixter = st.checkbox("Search ccMixter (license review required)", value=True)
+    include_openverse = st.checkbox("Search Openverse (open-license discovery only)", value=True)
     max_tracks = st.selectbox("Tracks to test", [10, 25, 50, 100, "All"], index=0)
 
 uploads = st.file_uploader("Upload your Spotify playlist ZIP files", type=["zip"], accept_multiple_files=True)
@@ -295,7 +373,7 @@ if uploads:
             if not client_id.strip():
                 st.warning("Enter your Jamendo Client ID in the sidebar.")
             else:
-                rows, eligible, discovery, ccmixter_results = [], [], [], []
+                rows, eligible, discovery, ccmixter_results, openverse_results = [], [], [], [], []
                 progress = st.progress(0)
                 status = st.empty()
                 total = max(len(subset), 1)
@@ -304,6 +382,9 @@ if uploads:
                     jamendo = jamendo_search(title, artist, client_id.strip())
                     ia = archive_discovery(title, artist) if include_ia else []
                     cc, cc_diag = ccmixter_discovery(title, artist) if include_ccmixter else ([], {"api_status": "disabled", "columns": [], "rows_received": 0, "error": ""})
+                    ov = openverse_discovery(title, artist) if include_openverse else []
+                    for match in ov:
+                        openverse_results.append({**item.to_dict(), **match})
                     for match in cc:
                         ccmixter_results.append({**item.to_dict(), **match, "Download allowed": "No"})
                     if jamendo:
@@ -333,6 +414,8 @@ if uploads:
                             source_labels.append("Internet Archive")
                         if include_ccmixter:
                             source_labels.append("ccMixter")
+                        if include_openverse:
+                            source_labels.append("Openverse")
                         rows.append({**item.to_dict(), "Source": " + ".join(source_labels), "Match status": "No eligible exact free match found", "Download allowed": "No"})
                     progress.progress(index / total)
                     status.caption(f"Checked {index} of {total}: {title} - {artist}")
@@ -340,6 +423,7 @@ if uploads:
                 st.session_state["eligible_rows"] = eligible
                 st.session_state["discovery_rows"] = discovery
                 st.session_state["ccmixter_rows"] = ccmixter_results
+                st.session_state["openverse_rows"] = openverse_results
                 st.session_state["ccmixter_diagnostics"] = cc_diag
                 st.session_state["search_key"] = (tuple(selected), len(subset))
                 status.success("Search finished. Jamendo download permissions are shown as reported by Jamendo. Review source pages and license terms.")
@@ -382,6 +466,31 @@ if "search_rows" in st.session_state:
                 continue
             shown_links.add(link_key)
             st.markdown(f"- [{item['Requested track']} - {item['Requested artist']}]({item['Source page']})")
+    openverse_rows = st.session_state.get("openverse_rows", [])
+    st.subheader("Openverse openly licensed audio discovery (not pre-approved for download)")
+    if openverse_rows:
+        st.warning("Openverse indexes openly licensed media, but a license label does not prove the uploader owns the recording or that it is the requested original/authorized cover. No direct MP3 download links are provided. Open each source page and review the license and attribution requirements.")
+        ov_df = pd.DataFrame(openverse_rows).drop_duplicates(
+            subset=["Playlist", "Requested track", "Requested artist", "Matched title", "Creator", "Source page"],
+            keep="first"
+        )
+        for category in [
+            "Exact title + creator metadata (unverified)",
+            "Possible cover/remix or alternate version (unverified)",
+            "Same title only (not a confirmed alternative)",
+        ]:
+            st.markdown(f"**{category}**")
+            subset_df = ov_df[ov_df["Category"] == category]
+            if not subset_df.empty:
+                st.dataframe(subset_df.drop(columns=["Download URL"], errors="ignore"), use_container_width=True, hide_index=True)
+                for item in subset_df.to_dict("records"):
+                    if item.get("Source page"):
+                        st.markdown(f"- [{item['Matched title']} - {item['Creator']}]({item['Source page']}) · {item['License']}")
+            else:
+                st.info("No results in this category.")
+    else:
+        st.info("No exact-title Openverse audio candidates were returned for this test.")
+
     cc_rows = st.session_state.get("ccmixter_rows", [])
     st.subheader("ccMixter discovery (license review required)")
     if cc_rows:
@@ -430,4 +539,4 @@ if "search_rows" in st.session_state:
         if cc_diag.get("error"):
             st.error(cc_diag["error"])
 
-st.caption("Important: exact metadata matches do not establish copyright ownership. Internet Archive listings are never treated as authorized downloads by this app. Jamendo download eligibility is based on Jamendo's API permission flag and should still be checked on the source page.")
+st.caption("Important: exact metadata matches do not establish copyright ownership or recording identity. Internet Archive, Openverse, and ccMixter listings are discovery-only and are never treated as authorized downloads by this app. Jamendo download eligibility is based on Jamendo's API permission flag and should still be checked on the source page.")
